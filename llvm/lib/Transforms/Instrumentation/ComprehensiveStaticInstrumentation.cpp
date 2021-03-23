@@ -130,6 +130,11 @@ static cl::opt<bool>
         "csi-split-blocks-at-calls", cl::init(true), cl::Hidden,
         cl::desc("Split basic blocks at function calls."));
 
+static cl::opt<bool>
+    ClEnableFedTables("csi-enable-fedtable", cl::init(false),
+        cl::desc("Enable front end data tables"),
+        cl::Hidden);
+
 static size_t numPassRuns = 0;
 bool IsFirstRun() { return numPassRuns == 0; }
 
@@ -301,7 +306,10 @@ bool CSIImpl::run() {
   for (Function &F : M)
     instrumentFunction(F);
 
-  collectUnitFEDTables();
+  collectUnitIdTables();
+  if (Options.EnableFedTables) {
+    collectUnitFEDTables();
+  }
   collectUnitSizeTables();
 
   finalizeCsi();
@@ -436,6 +444,21 @@ Constant *SizeTable::insertIntoModule(Module &M) const {
       new GlobalVariable(M, TableArrayType, false, GlobalValue::InternalLinkage,
                          Table, CsiUnitSizeTableName);
   return ConstantExpr::getGetElementPtr(GV->getValueType(), GV, GepArgs);
+}
+
+uint64_t IdTable::add(const Function &F) {
+  uint64_t ID = getId(&F);
+  return ID;
+}
+
+uint64_t IdTable::add(const BasicBlock &BB) {
+  uint64_t ID = getId(&BB);
+  return ID;
+}
+
+uint64_t IdTable::add(const Instruction &I) {
+  uint64_t ID = getId(&I);
+  return ID;
 }
 
 uint64_t FrontEndDataTable::add(const Function &F) {
@@ -917,13 +940,19 @@ void CSIImpl::instrumentLoadOrStore(Instruction *I,
     return; // size that we don't recognize
 
   if (IsWrite) {
-    uint64_t LocalId = StoreFED.add(*I);
-    Value *CsiId = StoreFED.localToGlobalId(LocalId, IRB);
+    uint64_t LocalId = StoreIdTable.add(*I);
+    Value *CsiId = StoreIdTable.localToGlobalId(LocalId, IRB);
+    if (Options.EnableFedTables) {
+      StoreFED.add(*I);
+    }
     addLoadStoreInstrumentation(I, CsiBeforeWrite, CsiAfterWrite, CsiId,
                                 AddrType, Addr, NumBytes, Prop);
   } else { // is read
-    uint64_t LocalId = LoadFED.add(*I);
-    Value *CsiId = LoadFED.localToGlobalId(LocalId, IRB);
+    uint64_t LocalId = LoadIdTable.add(*I);
+    Value *CsiId = LoadIdTable.localToGlobalId(LocalId, IRB);
+    if (Options.EnableFedTables) {
+      LoadFED.add(*I);
+    }
     addLoadStoreInstrumentation(I, CsiBeforeRead, CsiAfterRead, CsiId, AddrType,
                                 Addr, NumBytes, Prop);
   }
@@ -974,12 +1003,15 @@ bool CSIImpl::instrumentMemIntrinsic(Instruction *I) {
 
 void CSIImpl::instrumentBasicBlock(BasicBlock &BB) {
   IRBuilder<> IRB(&*BB.getFirstInsertionPt());
-  uint64_t LocalId = BasicBlockFED.add(BB);
+  uint64_t LocalId = BasicBlockIdTable.add(BB);
+  Value *CsiId = BasicBlockIdTable.localToGlobalId(LocalId, IRB);
+  if (Options.EnableFedTables) {
+    BasicBlockFED.add(BB);
+  }
   uint64_t BBSizeId = BBSize.add(BB, GetTTI ?
                                  &(*GetTTI)(*BB.getParent()) : nullptr);
   assert(LocalId == BBSizeId &&
-         "BB recieved different ID's in FED and sizeinfo tables.");
-  Value *CsiId = BasicBlockFED.localToGlobalId(LocalId, IRB);
+         "BB recieved different ID's in ID and sizeinfo tables.");
   CsiBBProperty Prop;
   Prop.setIsLandingPad(BB.isLandingPad());
   Prop.setIsEHPad(BB.isEHPad());
@@ -1022,7 +1054,10 @@ void CSIImpl::instrumentLoop(Loop &L, TaskInfo &TI, ScalarEvolution *SE) {
 
   // We assign a local ID for this loop here, so that IDs for loops follow a
   // depth-first ordering.
-  csi_id_t LocalId = LoopFED.add(*Header);
+  uint64_t LocalId = LoopIdTable.add(*Header);
+  if (Options.EnableFedTables) {
+    LoopFED.add(*Header);
+  }
 
   // Recursively instrument each subloop.
   for (Loop *SubL : L)
@@ -1034,7 +1069,7 @@ void CSIImpl::instrumentLoop(Loop &L, TaskInfo &TI, ScalarEvolution *SE) {
   LoopProp.setHasUniqueExitingBlock((ExitingBlocks.size() == 1));
 
   IRBuilder<> IRB(Preheader->getTerminator());
-  Value *LoopCsiId = LoopFED.localToGlobalId(LocalId, IRB);
+  Value *LoopCsiId = LoopIdTable.localToGlobalId(LocalId, IRB);
   Value *LoopPropVal = LoopProp.getValue(IRB);
 
   // Try to evaluate the runtime trip count for this loop.  Default to a count
@@ -1071,8 +1106,11 @@ void CSIImpl::instrumentLoop(Loop &L, TaskInfo &TI, ScalarEvolution *SE) {
 
     // Insert the loop-exit hook
     IRB.SetInsertPoint(BB->getTerminator());
-    csi_id_t LocalExitId = LoopExitFED.add(*BB);
-    Value *ExitCsiId = LoopFED.localToGlobalId(LocalExitId, IRB);
+    uint64_t LocalExitId = LoopExitIdTable.add(*BB);
+    if (Options.EnableFedTables) {
+      LoopExitFED.add(*BB);
+    }
+    Value *ExitCsiId = LoopExitIdTable.localToGlobalId(LocalExitId, IRB);
     Value *LoopExitPropVal = LoopExitProp.getValue(IRB);
     // TODO: For latches, record whether the loop will repeat.
     insertHookCall(&*IRB.GetInsertPoint(), CsiLoopBodyExit,
@@ -1113,8 +1151,11 @@ void CSIImpl::instrumentCallsite(Instruction *I, DominatorTree *DT) {
 
   IRBuilder<> IRB(I);
   Value *DefaultID = getDefaultID(IRB);
-  uint64_t LocalId = CallsiteFED.add(*I, Called ? Called->getName() : "");
-  Value *CallsiteId = CallsiteFED.localToGlobalId(LocalId, IRB);
+  uint64_t LocalId = CallsiteIdTable.add(*I);
+  if (Options.EnableFedTables) {
+    CallsiteFED.add(*I, Called ? Called->getName() : "");
+  }
+  Value *CallsiteId = CallsiteIdTable.localToGlobalId(LocalId, IRB);
   Value *FuncId = nullptr;
   GlobalVariable *FuncIdGV = nullptr;
   if (Called) {
@@ -1234,8 +1275,11 @@ void CSIImpl::instrumentDetach(DetachInst *DI, DominatorTree *DT, TaskInfo &TI,
   Value *DetachID;
   {
     IRBuilder<> IRB(DI);
-    uint64_t LocalID = DetachFED.add(*DI);
-    DetachID = DetachFED.localToGlobalId(LocalID, IDBuilder);
+    uint64_t LocalID = DetachIdTable.add(*DI);
+    if (Options.EnableFedTables) {
+      DetachFED.add(*DI);
+    }
+    DetachID = DetachIdTable.localToGlobalId(LocalID, IDBuilder);
     Value *TrackVar = TrackVars.lookup(DI->getSyncRegion());
     IRB.CreateStore(
         Constant::getIntegerValue(IntegerType::getInt32Ty(DI->getContext()),
@@ -1256,8 +1300,11 @@ void CSIImpl::instrumentDetach(DetachInst *DI, DominatorTree *DT, TaskInfo &TI,
   {
     // Instrument the entry point of the detached task.
     IRBuilder<> IRB(&*DetachedBlock->getFirstInsertionPt());
-    uint64_t LocalID = TaskFED.add(*DetachedBlock);
-    Value *TaskID = TaskFED.localToGlobalId(LocalID, IDBuilder);
+    uint64_t LocalID = TaskIdTable.add(*DetachedBlock);
+    if (Options.EnableFedTables) {
+      TaskFED.add(*DetachedBlock);
+    }
+    Value *TaskID = TaskIdTable.localToGlobalId(LocalID, IDBuilder);
     CsiTaskProperty Prop;
     Prop.setIsTapirLoopBody(TapirLoopBody);
     Instruction *Call = IRB.CreateCall(CsiTaskEntry, {TaskID, DetachID,
@@ -1305,8 +1352,11 @@ void CSIImpl::instrumentDetach(DetachInst *DI, DominatorTree *DT, TaskInfo &TI,
           CriticalEdgeSplittingOptions(DT, &LI).setSplitDetachContinue());
 
     IRBuilder<> IRB(&*ContinueBlock->getFirstInsertionPt());
-    uint64_t LocalID = DetachContinueFED.add(*ContinueBlock);
-    Value *ContinueID = DetachContinueFED.localToGlobalId(LocalID, IDBuilder);
+    uint64_t LocalID = DetachContinueIdTable.add(*ContinueBlock);
+    if (Options.EnableFedTables) {
+      DetachContinueFED.add(*ContinueBlock);
+    }
+    Value *ContinueID = DetachContinueIdTable.localToGlobalId(LocalID, IDBuilder);
     CsiDetachContinueProperty ContProp;
     Instruction *Call =
         IRB.CreateCall(CsiDetachContinue, {ContinueID, DetachID,
@@ -1327,8 +1377,11 @@ void CSIImpl::instrumentDetach(DetachInst *DI, DominatorTree *DT, TaskInfo &TI,
       PredBlock = getTaskFrameResume(TF)->getParent();
     }
     Value *DefaultID = getDefaultID(IDBuilder);
-    uint64_t LocalID = DetachContinueFED.add(*UnwindBlock);
-    Value *ContinueID = DetachContinueFED.localToGlobalId(LocalID, IDBuilder);
+    uint64_t LocalID = DetachContinueIdTable.add(*UnwindBlock);
+    if (Options.EnableFedTables) {
+      DetachContinueFED.add(*UnwindBlock);
+    }
+    Value *ContinueID = DetachContinueIdTable.localToGlobalId(LocalID, IDBuilder);
     CsiDetachContinueProperty ContProp;
     LLVMContext &C = M.getContext();
     Value *DefaultPropVal = ContProp.getValueImpl(C);
@@ -1344,8 +1397,11 @@ void CSIImpl::instrumentSync(SyncInst *SI,
   IRBuilder<> IRB(SI);
   Value *DefaultID = getDefaultID(IRB);
   // Get the ID of this sync.
-  uint64_t LocalID = SyncFED.add(*SI);
-  Value *SyncID = SyncFED.localToGlobalId(LocalID, IRB);
+  uint64_t LocalID = SyncIdTable.add(*SI);
+  if (Options.EnableFedTables) {
+    SyncFED.add(*SI);
+  }
+  Value *SyncID = SyncIdTable.localToGlobalId(LocalID, IRB);
 
   Value *TrackVar = TrackVars.lookup(SI->getSyncRegion());
 
@@ -1408,8 +1464,11 @@ void CSIImpl::instrumentAlloca(Instruction *I) {
   IRBuilder<> IRB(I);
   AllocaInst *AI = cast<AllocaInst>(I);
 
-  uint64_t LocalId = AllocaFED.add(*I);
-  Value *CsiId = AllocaFED.localToGlobalId(LocalId, IRB);
+  uint64_t LocalId = AllocaIdTable.add(*I);
+  if (Options.EnableFedTables) {
+    AllocaFED.add(*I);
+  }
+  Value *CsiId = AllocaIdTable.localToGlobalId(LocalId, IRB);
 
   CsiAllocaProperty Prop;
   Prop.setIsStatic(AI->isStaticAlloca());
@@ -1562,8 +1621,11 @@ void CSIImpl::instrumentAllocFn(Instruction *I, DominatorTree *DT) {
 
   IRBuilder<> IRB(I);
   Value *DefaultID = getDefaultID(IRB);
-  uint64_t LocalId = AllocFnFED.add(*I);
-  Value *AllocFnId = AllocFnFED.localToGlobalId(LocalId, IRB);
+  uint64_t LocalId = AllocFnIdTable.add(*I);
+  if (Options.EnableFedTables) {
+    AllocFnFED.add(*I);
+  }
+  Value *AllocFnId = AllocFnIdTable.localToGlobalId(LocalId, IRB);
 
   SmallVector<Value *, 4> AllocFnArgs;
   getAllocFnArgs(I, AllocFnArgs, IntptrTy, IRB.getInt8PtrTy(), *TLI);
@@ -1640,8 +1702,11 @@ void CSIImpl::instrumentFree(Instruction *I) {
   assert(Called && "Could not get called function for free.");
 
   IRBuilder<> IRB(I);
-  uint64_t LocalId = FreeFED.add(*I);
-  Value *FreeId = FreeFED.localToGlobalId(LocalId, IRB);
+  uint64_t LocalId = FreeIdTable.add(*I);
+  if (Options.EnableFedTables) {
+    FreeFED.add(*I);
+  }
+  Value *FreeId = FreeIdTable.localToGlobalId(LocalId, IRB);
 
   Value *Addr = FC->getArgOperand(0);
   CsiFreeProperty Prop;
@@ -1794,6 +1859,26 @@ void CSIImpl::insertHookCallAtSharedEHSpindleExits(
   }
 }
 
+
+void CSIImpl::initializeIdTables() {
+  FunctionIdTable = IdTable(M, CsiFunctionBaseIdName);
+  FunctionExitIdTable = IdTable(M, CsiFunctionExitBaseIdName);
+  LoopIdTable = IdTable(M, CsiLoopBaseIdName);
+  LoopExitIdTable = IdTable(M, CsiLoopExitBaseIdName);
+  BasicBlockIdTable = IdTable(M, CsiBasicBlockBaseIdName);
+  CallsiteIdTable = IdTable(M, CsiCallsiteBaseIdName);
+  LoadIdTable = IdTable(M, CsiLoadBaseIdName);
+  StoreIdTable = IdTable(M, CsiStoreBaseIdName);
+  AllocaIdTable = IdTable(M, CsiAllocaBaseIdName);
+  DetachIdTable = IdTable(M, CsiDetachBaseIdName);
+  TaskIdTable = IdTable(M, CsiTaskBaseIdName);
+  TaskExitIdTable = IdTable(M, CsiTaskExitBaseIdName);
+  DetachContinueIdTable = IdTable(M, CsiDetachContinueBaseIdName);
+  SyncIdTable = IdTable(M, CsiSyncBaseIdName);
+  AllocFnIdTable = IdTable(M, CsiAllocFnBaseIdName);
+  FreeIdTable = IdTable(M, CsiFreeBaseIdName);
+}
+
 void CSIImpl::initializeFEDTables() {
   FunctionFED = FrontEndDataTable(M, CsiFunctionBaseIdName,
                                   "__csi_unit_fed_table_function",
@@ -1840,7 +1925,10 @@ void CSIImpl::initializeSizeTables() {
 }
 
 uint64_t CSIImpl::getLocalFunctionID(Function &F) {
-  uint64_t LocalId = FunctionFED.add(F);
+  uint64_t LocalId = FunctionIdTable.add(F);
+  if (Options.EnableFedTables) {
+    FunctionFED.add(F);
+  }
   FuncOffsetMap[F.getName()] = LocalId;
   return LocalId;
 }
@@ -1872,6 +1960,7 @@ void CSIImpl::generateInitCallsiteToFunction() {
 void CSIImpl::initializeCsi() {
   IntptrTy = DL.getIntPtrType(M.getContext());
 
+  initializeIdTables();
   initializeFEDTables();
   initializeSizeTables();
   if (Options.InstrumentFuncEntryExit)
@@ -1913,6 +2002,12 @@ void CSIImpl::initializeCsi() {
   */
 }
 
+// IdTableType
+StructType *CSIImpl::getUnitIdTableType(LLVMContext &C) {
+  return StructType::get(IntegerType::get(C, 64), Type::getInt8PtrTy(C, 0),
+                         IntegerType::get(C, 64));
+}
+
 // Create a struct type to match the unit_fed_entry_t type in csirt.c.
 StructType *CSIImpl::getUnitFedTableType(LLVMContext &C,
                                          PointerType *EntryPointerType) {
@@ -1930,6 +2025,54 @@ Constant *CSIImpl::fedTableToUnitFedTable(Module &M,
   Constant *InsertedTable = FedTable.insertIntoModule(M);
   return ConstantStruct::get(UnitFedTableType, NumEntries, BaseIdPtr,
                              InsertedTable);
+}
+
+Constant *CSIImpl::idTableToUnitIdTable(Module &M, StructType *UnitIdTableType, IdTable &Table) {
+  Constant *NumEntries =
+      ConstantInt::get(IntegerType::get(M.getContext(), 64), Table.size());
+  Constant *BaseIdPtr = ConstantExpr::getPointerCast(
+      Table.baseId(), Type::getInt8PtrTy(M.getContext(), 0));
+  Constant *EnabledTables = ConstantInt::get(IntegerType::get(M.getContext(), 64), 
+        (uint64_t) (Options.EnableFedTables ? 1 : 0));
+  return ConstantStruct::get(UnitIdTableType, NumEntries, BaseIdPtr,
+                            EnabledTables);
+}
+
+void CSIImpl::collectUnitIdTables() {
+  // ww1
+  LLVMContext &C = M.getContext();
+  StructType *UnitIdTableType = getUnitIdTableType(C);
+
+   // The order of the id tables here must match the enum in csirt.c and the
+  // instrumentation_counts_t in csi.h.
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, FunctionIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, FunctionExitIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, LoopIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, LoopExitIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, BasicBlockIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, CallsiteIdTable));
+  UnitIdTables.push_back(idTableToUnitIdTable(M, UnitIdTableType, LoadIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, StoreIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, DetachIdTable));
+  UnitIdTables.push_back(idTableToUnitIdTable(M, UnitIdTableType, TaskIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, TaskExitIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, DetachContinueIdTable));
+  UnitIdTables.push_back(idTableToUnitIdTable(M, UnitIdTableType, SyncIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, AllocaIdTable));
+  UnitIdTables.push_back(
+      idTableToUnitIdTable(M, UnitIdTableType, AllocFnIdTable));
+  UnitIdTables.push_back(idTableToUnitIdTable(M, UnitIdTableType, FreeIdTable));
 }
 
 void CSIImpl::collectUnitFEDTables() {
@@ -1999,6 +2142,7 @@ void CSIImpl::collectUnitSizeTables() {
 CallInst *CSIImpl::createRTUnitInitCall(IRBuilder<> &IRB) {
   LLVMContext &C = M.getContext();
 
+  StructType *UnitIdTableType = getUnitIdTableType(C);
   StructType *UnitFedTableType =
       getUnitFedTableType(C, FrontEndDataTable::getPointerType(C));
   StructType *UnitSizeTableType =
@@ -2013,30 +2157,50 @@ CallInst *CSIImpl::createRTUnitInitCall(IRBuilder<> &IRB) {
       FunctionType::get(IRB.getVoidTy(), InitArgTypes, false);
   RTUnitInit = M.getOrInsertFunction(CsiRtUnitInitName, InitFunctionTy);
 
-  ArrayType *UnitFedTableArrayType =
-      ArrayType::get(UnitFedTableType, UnitFedTables.size());
-  Constant *FEDTable = ConstantArray::get(UnitFedTableArrayType, UnitFedTables);
-  GlobalVariable *FEDGV = new GlobalVariable(
-      M, UnitFedTableArrayType, false, GlobalValue::InternalLinkage, FEDTable,
-      CsiUnitFedTableArrayName);
   ArrayType *UnitSizeTableArrayType =
-      ArrayType::get(UnitSizeTableType, UnitSizeTables.size());
+    ArrayType::get(UnitSizeTableType, UnitSizeTables.size());
   Constant *SzTable =
       ConstantArray::get(UnitSizeTableArrayType, UnitSizeTables);
   GlobalVariable *SizeGV = new GlobalVariable(
       M, UnitSizeTableArrayType, false, GlobalValue::InternalLinkage, SzTable,
       CsiUnitSizeTableArrayName);
 
+  ArrayType *UnitIdTableArrayType =
+    ArrayType::get(UnitIdTableType, UnitIdTables.size());
+  Constant *MetaTable =
+      ConstantArray::get(UnitIdTableArrayType, UnitIdTables);
+  GlobalVariable *IdGV = new GlobalVariable(
+      M, UnitIdTableType, false, GlobalValue::InternalLinkage, MetaTable,
+      CsiUnitIdTableArrayName);
+
   Constant *Zero = ConstantInt::get(IRB.getInt32Ty(), 0);
   Value *GepArgs[] = {Zero, Zero};
 
+  if (Options.EnableFedTables) {
+    ArrayType *UnitFedTableArrayType = ArrayType::get(UnitFedTableType, UnitFedTables.size());
+    Constant *FEDTable = ConstantArray::get(UnitFedTableArrayType, UnitFedTables);
+    GlobalVariable *FEDGV = new GlobalVariable(
+      M, UnitFedTableArrayType, false, GlobalValue::InternalLinkage, FEDTable,
+      CsiUnitFedTableArrayName);
+
   // Insert call to __csirt_unit_init
+    return IRB.CreateCall(
+      RTUnitInit,
+      {IRB.CreateGlobalStringPtr(M.getName()),
+      ConstantExpr::getGetElementPtr(IdGV->getValueType(), IdGV, GepArgs),
+      ConstantExpr::getGetElementPtr(FEDGV->getValueType(), FEDGV, GepArgs),
+      ConstantExpr::getGetElementPtr(SizeGV->getValueType(), SizeGV, GepArgs),
+      InitCallsiteToFunction});
+  }
+
+  // Insert call to __csirt_unit_init, null fed table ptr if fed tables disabled
   return IRB.CreateCall(
       RTUnitInit,
       {IRB.CreateGlobalStringPtr(M.getName()),
-       ConstantExpr::getGetElementPtr(FEDGV->getValueType(), FEDGV, GepArgs),
-       ConstantExpr::getGetElementPtr(SizeGV->getValueType(), SizeGV, GepArgs),
-       InitCallsiteToFunction});
+      ConstantExpr::getGetElementPtr(IdGV->getValueType(), IdGV, GepArgs),
+      ConstantPointerNull::get(FrontEndDataTable::getPointerType(C)),
+      ConstantExpr::getGetElementPtr(SizeGV->getValueType(), SizeGV, GepArgs),
+      InitCallsiteToFunction});
 }
 
 void CSIImpl::finalizeCsi() {

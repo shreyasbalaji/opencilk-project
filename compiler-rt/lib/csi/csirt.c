@@ -264,12 +264,28 @@ static inline void add_fed_table(fed_type_t fed_type, uint64_t num_entries,
 // a private ID space per FED type). The "base" ID value is the global
 // ID that corresponds to the unit's local ID 0. This function stores
 // the correct value into a unit's base ID.
-static inline void update_ids(fed_type_t fed_type, uint64_t num_entries,
+static inline void update_ids_fed(fed_type_t fed_type, uint64_t num_entries,
                               csi_id_t *fed_id_base) {
     fed_table_index_t *index = &fed_tables[fed_type];
     // The base ID is the current number of FED entries before adding
     // the new FED table.
     *fed_id_base = index->num_total_entries - num_entries;
+}
+
+static inline void update_meta(fed_type_t fed_type, uint64_t id_count, csi_id_t *id_base) {
+    fed_table_index_t *index = &fed_tables[fed_type];
+    fed_table_t *table = get_table_for_insertion(index);
+    source_loc_t null_source_loc = {NULL, -1, -1, NULL};
+
+    for (uint64_t i = 0; i < id_count; i++) {
+      if (is_table_full(table)) {
+        table = allocate_new_table_and_append_to_index(index);
+      }
+      add_entry_to_table(table, &null_source_loc);
+    }
+
+    index->num_total_entries += id_count;
+    *id_base = index->num_total_entries - id_count;
 }
 
 static inline fed_table_t *get_table_for_id(const fed_table_index_t *index,
@@ -372,6 +388,12 @@ typedef struct {
 } unit_fed_table_t;
 
 typedef struct {
+    uint64_t id_count;
+    csi_id_t *id_base;
+    uint64_t enabled_tables;
+} unit_id_table_t;
+
+typedef struct {
   int64_t num_entries;
   const sizeinfo_t *entries;
 } unit_sizeinfo_table_t;
@@ -400,6 +422,7 @@ _Atomic int32_t lock = 0;
 // before main().
 CSIRT_API void __csirt_unit_init(
     const char * const name,
+    unit_id_table_t *unit_id_tables,
     unit_fed_table_t *unit_fed_tables,
     unit_sizeinfo_table_t *unit_sizeinfo_tables,
     __csi_init_callsite_to_functions callsite_to_func_init) {
@@ -421,10 +444,22 @@ CSIRT_API void __csirt_unit_init(
       initialize_fed_tables();
     }
 
-    // Add all FED tables from the new unit
     for (unsigned i = 0; i < NUM_FED_TYPES; i++) {
-        add_fed_table(i, unit_fed_tables[i].num_entries, unit_fed_tables[i].entries);
-        update_ids(i, unit_fed_tables[i].num_entries, unit_fed_tables[i].id_base);
+      if ((unit_id_tables[i].enabled_tables & 0x1) > 0) {
+          add_fed_table(i, unit_fed_tables[i].num_entries, unit_fed_tables[i].entries);
+          update_ids_fed(i, unit_fed_tables[i].num_entries, unit_fed_tables[i].id_base);
+      }
+      else {
+        update_meta(i, unit_id_tables[i].id_count, unit_id_tables[i].id_base);
+      }
+    }
+
+    if (unit_fed_tables) {
+      // Add all FED tables from the new unit
+      for (unsigned i = 0; i < NUM_FED_TYPES; i++) {
+          add_fed_table(i, unit_fed_tables[i].num_entries, unit_fed_tables[i].entries);
+          update_ids_fed(i, unit_fed_tables[i].num_entries, unit_fed_tables[i].id_base);
+      }
     }
 
     // Add all SizeInfo tables from the new unit

@@ -206,6 +206,7 @@ struct CSIOptions {
   bool jitMode = false;
   bool CallsMayThrow = true;
   bool CallsTerminateBlocks = true;
+  bool EnableFedTables = false;
 
   CSIOptions() = default;
 };

@@ -62,6 +62,7 @@ static const char *const CsiUnitSizeTableName = "__csi_unit_size_table";
 static const char *const CsiUnitFedTableName = "__csi_unit_fed_table";
 static const char *const CsiFuncIdVariablePrefix = "__csi_func_id_";
 static const char *const CsiUnitFedTableArrayName = "__csi_unit_fed_tables";
+static const char *const CsiUnitIdTableArrayName = "__csi_unit_id_tables";
 static const char *const CsiUnitSizeTableArrayName = "__csi_unit_size_tables";
 static const char *const CsiInitCallsiteToFunctionName =
     "__csi_init_callsite_to_function";
@@ -75,6 +76,7 @@ static const csi_id_t CsiCallsiteUnknownTargetId = CsiUnknownId;
 static const int CsiUnitCtorPriority = 0;
 
 /// Maintains a mapping from CSI ID to static data for that ID.
+
 class ForensicTable {
 public:
   ForensicTable() {}
@@ -110,6 +112,24 @@ protected:
   /// Map of Value to Local ID.
   DenseMap<const Value *, uint64_t> ValueToLocalIdMap;
   StringRef TableName;
+};
+
+class IdTable : public ForensicTable  {
+public:
+  IdTable() : ForensicTable() {}
+  IdTable(Module &M, StringRef BaseIdName) : ForensicTable(M, BaseIdName) {}
+
+  /// Add the given Function to this FED table.
+  /// \returns The local ID of the Function.
+  uint64_t add(const Function &F);
+
+  /// Add the given BasicBlock to this FED table.
+  /// \returns The local ID of the BasicBlock.
+  uint64_t add(const BasicBlock &BB);
+
+  /// Add the given Instruction to this FED table.
+  /// \returns The local ID of the Instruction.
+  uint64_t add(const Instruction &I);
 };
 
 /// Maintains a mapping from CSI ID to front-end data for that ID.
@@ -1102,16 +1122,24 @@ protected:
   void initializeAllocFnHooks();
   /// @}
 
+  static StructType *getUnitIdTableType(LLVMContext &C);
   static StructType *getUnitFedTableType(LLVMContext &C,
                                          PointerType *EntryPointerType);
   static Constant *fedTableToUnitFedTable(Module &M,
                                           StructType *UnitFedTableType,
                                           FrontEndDataTable &FedTable);
+  Constant *idTableToUnitIdTable(Module &M,
+                                        StructType *UnitIdTableType, 
+                                        IdTable &Table);
   static StructType *getUnitSizeTableType(LLVMContext &C,
                                           PointerType *EntryPointerType);
   static Constant *sizeTableToUnitSizeTable(Module &M,
                                             StructType *UnitSizeTableType,
                                             SizeTable &SzTable);
+    /// Initialize Id Table structures
+  void initializeIdTables();
+  // Collect Id Table structures
+  void collectUnitIdTables();
   /// Initialize the front-end data table structures.
   void initializeFEDTables();
   /// Collect unit front-end data table structures for finalization.
@@ -1451,6 +1479,11 @@ protected:
     LoopExitFED, CallsiteFED, LoadFED, StoreFED, AllocaFED, DetachFED,
     TaskFED, TaskExitFED, DetachContinueFED, SyncFED, AllocFnFED, FreeFED;
 
+  IdTable FunctionIdTable, FunctionExitIdTable, BasicBlockIdTable, LoopIdTable,
+    LoopExitIdTable, CallsiteIdTable, LoadIdTable, StoreIdTable, AllocaIdTable, DetachIdTable,
+    TaskIdTable, TaskExitIdTable, DetachContinueIdTable, SyncIdTable, AllocFnIdTable, FreeIdTable;
+
+  SmallVector<Constant *, 12> UnitIdTables;
   SmallVector<Constant *, 12> UnitFedTables;
 
   SizeTable BBSize;
